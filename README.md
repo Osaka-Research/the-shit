@@ -31,7 +31,7 @@ a real LLM.
 
 Or click the deploy button:
 
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/<you>/voice-relay)
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/Osaka-Research/the-shit)
 
 No environment variables are required for the stub. Works in any modern
 browser (`getUserMedia` + `MediaRecorder` are broadly supported, unlike the
