@@ -12,8 +12,11 @@ WORKDIR /whisper.cpp
 # don't ship, which cuts the build noticeably. -j capped (not left to
 # default to nproc) — Render's build machine has more cores than it has RAM
 # for unbounded parallel C++ compiles, which OOM-killed the build at the
-# default setting.
-RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
+# default setting. GGML_NATIVE=OFF is the important one: ggml defaults to
+# -march=native, baking in whatever CPU extensions the *build* machine has —
+# if the runtime instance's CPU doesn't support those, the binary SIGILLs
+# (exit code -4) the instant it hits one. Off means a portable baseline ISA.
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
     && cmake --build build -j 2 --config Release --target whisper-server
 
 # tiny.en fits comfortably in Render's Starter 512MB plan alongside FastAPI.
@@ -35,9 +38,9 @@ WORKDIR /llama.cpp
 
 # Only the server target — no model baked in here. The model is downloaded
 # at container startup from LLAMA_MODEL_URL instead (see app/main.py), since
-# it needs to be swappable without rebuilding the image every time. -j capped
-# for the same reason as whisper.cpp above.
-RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
+# it needs to be swappable without rebuilding the image every time. -j and
+# GGML_NATIVE=OFF for the same reasons as whisper.cpp above.
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
     && cmake --build build -j 2 --config Release --target llama-server
 
 # --- stage 3: runtime ---
