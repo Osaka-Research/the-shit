@@ -9,9 +9,12 @@ RUN git clone --depth 1 https://github.com/ggerganov/whisper.cpp.git /whisper.cp
 WORKDIR /whisper.cpp
 
 # Only build the server target — skips the cli/tests/parakeet examples we
-# don't ship, which cuts the build noticeably.
+# don't ship, which cuts the build noticeably. -j capped (not left to
+# default to nproc) — Render's build machine has more cores than it has RAM
+# for unbounded parallel C++ compiles, which OOM-killed the build at the
+# default setting.
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build -j --config Release --target whisper-server
+    && cmake --build build -j 2 --config Release --target whisper-server
 
 # tiny.en fits comfortably in Render's Starter 512MB plan alongside FastAPI.
 # Bump to base.en (bigger, more accurate) if you move to the Standard plan —
@@ -32,9 +35,10 @@ WORKDIR /llama.cpp
 
 # Only the server target — no model baked in here. The model is downloaded
 # at container startup from LLAMA_MODEL_URL instead (see app/main.py), since
-# it needs to be swappable without rebuilding the image every time.
+# it needs to be swappable without rebuilding the image every time. -j capped
+# for the same reason as whisper.cpp above.
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build -j --config Release --target llama-server
+    && cmake --build build -j 2 --config Release --target llama-server
 
 # --- stage 3: runtime ---
 FROM python:3.12-slim
