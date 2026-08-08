@@ -157,6 +157,17 @@ function handleFinalTranscript(transcript) {
 
 // ── recording one utterance, server-side transcription ──
 
+const STATUS_FLASH_MS = 1500;
+
+// beginListening() immediately overwrites the status line with "Listening...",
+// so a message set right before it would never actually be seen — this
+// delays the restart just long enough for the message to be readable.
+function beginListeningAfterFlash(delay = STATUS_FLASH_MS) {
+  setTimeout(() => {
+    if (sessionActive) beginListening();
+  }, delay);
+}
+
 async function finalizeUtterance() {
   const blob = new Blob(currentChunks, { type: mimeType || "audio/webm" });
   currentChunks = [];
@@ -165,8 +176,12 @@ async function finalizeUtterance() {
   if (!sessionActive) return; // stopSession() already tore everything down
 
   if (!spoke || blob.size < 800) {
-    // nothing meaningful captured — go straight back to listening
-    beginListening();
+    // Nothing crossed the speech-volume threshold for the whole utterance
+    // window — either genuine silence, or (if this keeps happening every
+    // time) the mic/analyser isn't picking up audio at all. Flash a status
+    // so that's visible instead of just silently re-looping forever.
+    setStatus("Didn't hear anything — still listening");
+    beginListeningAfterFlash();
     return;
   }
 
@@ -180,14 +195,15 @@ async function finalizeUtterance() {
     const data = await res.json();
     const transcript = (data.transcript || "").trim();
     if (!transcript) {
-      if (sessionActive) beginListening();
+      setStatus("Heard you, but transcript came back empty — still listening");
+      beginListeningAfterFlash();
       return;
     }
     handleFinalTranscript(transcript);
   } catch (err) {
     console.error(err);
-    setStatus("Transcription error");
-    if (sessionActive) beginListening();
+    setStatus("Transcription error — is whisper-server running?");
+    beginListeningAfterFlash();
   }
 }
 
@@ -267,6 +283,13 @@ async function startSession() {
 
   mimeType = pickMimeType();
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === "suspended") {
+    // Some browsers create AudioContext in a suspended state even inside a
+    // click handler — without this, the analyser silently reads all zeros
+    // forever, the volume loop never detects speech, and every utterance
+    // just times out and restarts, looking like it's "stuck listening".
+    await audioCtx.resume();
+  }
   const source = audioCtx.createMediaStreamSource(mediaStream);
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = 1024;
