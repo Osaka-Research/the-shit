@@ -127,6 +127,32 @@ def start_whisper_server():
             logger.error("whisper-server did not come up within timeout (still running, just slow to bind)")
 
 
+def _llama_source_marker_path() -> Path:
+    return Path(str(LLAMA_MODEL_PATH) + ".source_url")
+
+
+def _invalidate_stale_llama_model():
+    # On a persistent disk, a model downloaded from a previous LLAMA_MODEL_URL
+    # sticks around across deploys/restarts — the "only download if missing"
+    # check would otherwise happily keep serving last week's model forever
+    # even after you point the env var somewhere else. Compare against a
+    # marker file recording which URL produced the cached file, and clear
+    # it out if the configured URL has changed since.
+    dest = Path(LLAMA_MODEL_PATH)
+    marker = _llama_source_marker_path()
+    if not dest.exists():
+        return
+    previous_url = marker.read_text().strip() if marker.exists() else None
+    if LLAMA_MODEL_URL and previous_url != LLAMA_MODEL_URL:
+        logger.info(
+            "LLAMA_MODEL_URL changed (was %s) — clearing cached model at %s so it re-downloads",
+            previous_url or "unknown",
+            dest,
+        )
+        dest.unlink()
+        marker.unlink(missing_ok=True)
+
+
 async def _download_llama_model() -> bool:
     dest = Path(LLAMA_MODEL_PATH)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -140,6 +166,7 @@ async def _download_llama_model() -> bool:
                     async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
                         f.write(chunk)
         tmp.rename(dest)
+        _llama_source_marker_path().write_text(LLAMA_MODEL_URL)
         logger.info("LLM model download complete: %s", dest)
         return True
     except (httpx.HTTPError, OSError) as err:
@@ -154,6 +181,8 @@ async def _prepare_and_start_llama():
     # the app from becoming ready — Render's deploy health check would time
     # out waiting on it otherwise.
     global _llama_proc
+
+    _invalidate_stale_llama_model()
 
     if not Path(LLAMA_MODEL_PATH).exists():
         if not LLAMA_MODEL_URL:
