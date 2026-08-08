@@ -3,18 +3,11 @@ services:
     name: voice-relay
     runtime: docker
     # Standard: 2GB RAM, 1 real dedicated vCPU (vs. Starter's 0.5 vCPU
-    # slice, which is what caused the transcription timeouts — 4 default
-    # whisper threads fighting over a fraction of a core). Dockerfile now
-    # builds base.en by default too, which needs the extra RAM headroom.
+    # slice, which is what caused the original transcription timeouts).
+    # No disk needed — LLM replies go through Groq (hosted), not a
+    # self-hosted model, so there's nothing left that needs persistent
+    # storage.
     plan: standard
     region: oregon
     healthCheckPath: /api/health
     autoDeploy: true
-    # Persists the LLM model across deploys/restarts — without this,
-    # Render's default ephemeral disk means LLAMA_MODEL_URL re-downloads
-    # the multi-GB file on every single boot. LLAMA_MODEL_PATH is set to
-    # /data/llm.gguf (this disk's mount point) in the Dockerfile.
-    disk:
-      name: voice-relay-data
-      mountPath: /data
-      sizeGB: 10
