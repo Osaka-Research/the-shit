@@ -69,8 +69,10 @@ COPY --from=whisper-build /whisper.cpp/build/bin/ /opt/whisper/bin/
 COPY --from=whisper-build /whisper.cpp/models/ggml-model.bin /opt/whisper/models/ggml-model.bin
 
 # Same deal for llama-server's shared libs. No model copied here — see
-# LLAMA_MODEL_URL below, it's fetched at startup into /app/models instead
-# (the app's own writable dir, unlike /opt in this image).
+# LLAMA_MODEL_URL below, it's fetched at startup onto the persistent disk
+# mounted at /data (see render.yaml) instead of the container's own
+# ephemeral filesystem, so it survives deploys/restarts instead of
+# re-downloading every time.
 COPY --from=llama-build /llama.cpp/build/bin/ /opt/llama/bin/
 
 ENV LD_LIBRARY_PATH=/opt/whisper/bin:/opt/llama/bin \
@@ -78,7 +80,8 @@ ENV LD_LIBRARY_PATH=/opt/whisper/bin:/opt/llama/bin \
     WHISPER_MODEL_PATH=/opt/whisper/models/ggml-model.bin \
     WHISPER_SERVER_PORT=8090 \
     LLAMA_SERVER_BIN=/opt/llama/bin/llama-server \
-    LLAMA_SERVER_PORT=8091
+    LLAMA_SERVER_PORT=8091 \
+    LLAMA_MODEL_PATH=/data/llm.gguf
 # LLAMA_MODEL_URL is intentionally not set here — set it in the Render
 # dashboard (Settings → Environment) to a direct GGUF download URL. Without
 # it, /api/reply just keeps using the canned stub replies.

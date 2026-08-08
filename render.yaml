@@ -10,3 +10,11 @@ services:
     region: oregon
     healthCheckPath: /api/health
     autoDeploy: true
+    # Persists the LLM model across deploys/restarts — without this,
+    # Render's default ephemeral disk means LLAMA_MODEL_URL re-downloads
+    # the multi-GB file on every single boot. LLAMA_MODEL_PATH is set to
+    # /data/llm.gguf (this disk's mount point) in the Dockerfile.
+    disk:
+      name: voice-relay-data
+      mountPath: /data
+      sizeGB: 4
