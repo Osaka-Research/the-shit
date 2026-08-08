@@ -52,6 +52,14 @@ LLAMA_SYSTEM_PROMPT = os.environ.get(
     "You are a helpful voice assistant. Keep replies short — one or two sentences — since they get read aloud.",
 )
 
+# Groq, if configured, is tried first — self-hosting a 3B model on a 1 vCPU
+# Render instance couldn't keep up (67 tokens took ~70s), and Groq's LPU
+# hardware is drastically faster for basically free at this usage volume.
+# Falls back to local llama-server, then canned replies, same as before.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-20b")
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+
 app = FastAPI(title="voice-relay")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -280,6 +288,29 @@ async def reply(req: ReplyRequest):
     logger.info("reply for transcript: %s", transcript)
     if not transcript:
         return ReplyResponse(reply="I didn't catch that.")
+
+    if GROQ_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    GROQ_CHAT_URL,
+                    headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+                    json={
+                        "model": GROQ_MODEL,
+                        "messages": [
+                            {"role": "system", "content": LLAMA_SYSTEM_PROMPT},
+                            {"role": "user", "content": transcript},
+                        ],
+                        "max_tokens": 80,
+                        "temperature": 0.7,
+                    },
+                )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+            if content:
+                return ReplyResponse(reply=content)
+        except (httpx.HTTPError, KeyError, IndexError) as err:
+            logger.error("Groq request failed, falling back: %s", err)
 
     if _llama_proc is not None:
         try:
