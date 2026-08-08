@@ -96,6 +96,9 @@ def _wait_for_port(port: int, timeout: float = 30.0) -> bool:
 def start_whisper_server():
     global _whisper_proc
     logger.info("starting whisper-server: %s -m %s --port %s", WHISPER_SERVER_BIN, WHISPER_MODEL_PATH, WHISPER_PORT)
+    # No stdout/stderr redirection — inherit the parent's, so whisper-server's
+    # own output (including crash reasons: OOM, missing model, bad lib path)
+    # lands in the same log stream as everything else instead of vanishing.
     _whisper_proc = subprocess.Popen(
         [
             WHISPER_SERVER_BIN,
@@ -104,13 +107,15 @@ def start_whisper_server():
             "--port", str(WHISPER_PORT),
             "--convert",  # transcode incoming webm/opus via ffmpeg before inference
         ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.STDOUT,
     )
-    if _wait_for_port(WHISPER_PORT):
+    if _wait_for_port(WHISPER_PORT, timeout=60):
         logger.info("whisper-server is up on port %s", WHISPER_PORT)
     else:
-        logger.error("whisper-server did not come up within timeout")
+        exit_code = _whisper_proc.poll()
+        if exit_code is not None:
+            logger.error("whisper-server exited early with code %s — see its output above for why", exit_code)
+        else:
+            logger.error("whisper-server did not come up within timeout (still running, just slow to bind)")
 
 
 async def _download_llama_model() -> bool:
@@ -154,6 +159,8 @@ async def _prepare_and_start_llama():
 
     logger.info("starting llama-server: %s -m %s --port %s", LLAMA_SERVER_BIN, LLAMA_MODEL_PATH, LLAMA_PORT)
     try:
+        # No stdout/stderr redirection — see the comment on whisper-server's
+        # Popen call for why: we want its own crash output in the logs.
         _llama_proc = subprocess.Popen(
             [
                 LLAMA_SERVER_BIN,
@@ -162,8 +169,6 @@ async def _prepare_and_start_llama():
                 "--port", str(LLAMA_PORT),
                 "-c", str(LLAMA_CTX_SIZE),
             ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
         )
     except FileNotFoundError:
         logger.error("llama-server binary not found (LLAMA_SERVER_BIN=%s)", LLAMA_SERVER_BIN)
@@ -172,7 +177,11 @@ async def _prepare_and_start_llama():
     if await asyncio.to_thread(_wait_for_port, LLAMA_PORT, 120):
         logger.info("llama-server is up on port %s", LLAMA_PORT)
     else:
-        logger.error("llama-server did not come up within timeout")
+        exit_code = _llama_proc.poll()
+        if exit_code is not None:
+            logger.error("llama-server exited early with code %s — see its output above for why", exit_code)
+        else:
+            logger.error("llama-server did not come up within timeout (still running, just slow to bind)")
         _llama_proc = None
 
 
