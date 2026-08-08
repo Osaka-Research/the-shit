@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: voice-relay
+    runtime: docker
+    # Starter (512MB) fits FastAPI + whisper-server running the tiny.en
+    # model. If you rebuild with --build-arg WHISPER_MODEL=base.en for
+    # better accuracy, bump this to standard (2GB) — base.en alone uses
+    # ~150-250MB resident, tight alongside everything else on Starter.
+    plan: starter
+    region: oregon
+    healthCheckPath: /api/health
+    autoDeploy: true

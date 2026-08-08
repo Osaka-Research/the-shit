@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Relay</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <div class="wordmark">Voice Relay</div>
+
+  <button type="button" id="voice-toggle-btn" class="icon-toggle" aria-pressed="false" aria-label="Speak replies aloud: off">
+    <span class="icon-toggle-dot"></span>
+    Voice
+  </button>
+
+  <main>
+    <div class="orb-stage">
+      <button id="talk-btn" type="button" data-state="idle" aria-label="Start Conversation">
+        <span class="sr-only" id="talk-btn-label">Start Conversation</span>
+      </button>
+    </div>
+
+    <p class="status" id="status">Tap the orb to talk</p>
+    <p class="caption" id="caption" aria-live="polite"></p>
+
+    <button type="button" class="history-toggle" id="history-toggle" aria-expanded="false">
+      Show history
+    </button>
+
+    <section class="panel" id="panel" aria-label="Conversation history" hidden>
+      <div class="log" id="log"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

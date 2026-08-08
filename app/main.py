@@ -1,0 +1,211 @@
+import logging
+import os
+import random
+import socket
+import subprocess
+import time
+from pathlib import Path
+
+import httpx
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+logger = logging.getLogger("voice-relay")
+
+STATIC_DIR = Path(__file__).parent / "static"
+
+# whisper-server is spawned as a subprocess and talked to over localhost —
+# keeps the model resident in memory instead of reloading it per request.
+WHISPER_SERVER_BIN = os.environ.get("WHISPER_SERVER_BIN", "whisper-server")
+WHISPER_MODEL_PATH = os.environ.get("WHISPER_MODEL_PATH", "models/ggml-base.en.bin")
+WHISPER_PORT = int(os.environ.get("WHISPER_SERVER_PORT", "8090"))
+WHISPER_INFERENCE_URL = f"http://127.0.0.1:{WHISPER_PORT}/inference"
+
+# llama-server is the swappable LLM backend for /api/reply. It only starts if
+# a model file actually exists at LLAMA_MODEL_PATH — until you drop one
+# there, /api/reply keeps working off the canned stub replies below. Point
+# it at *any* chat-capable GGUF (Llama 3.1, Qwen, Mistral, whatever) and
+# restart the app — no code changes needed to swap models.
+LLAMA_SERVER_BIN = os.environ.get("LLAMA_SERVER_BIN", "llama-server")
+LLAMA_MODEL_PATH = os.environ.get("LLAMA_MODEL_PATH", str(Path(__file__).parent.parent / "models" / "llm.gguf"))
+LLAMA_PORT = int(os.environ.get("LLAMA_SERVER_PORT", "8091"))
+LLAMA_CTX_SIZE = os.environ.get("LLAMA_CTX_SIZE", "2048")
+LLAMA_CHAT_URL = f"http://127.0.0.1:{LLAMA_PORT}/v1/chat/completions"
+LLAMA_SYSTEM_PROMPT = os.environ.get(
+    "LLAMA_SYSTEM_PROMPT",
+    "You are a helpful voice assistant. Keep replies short — one or two sentences — since they get read aloud.",
+)
+
+app = FastAPI(title="voice-relay")
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+_whisper_proc: subprocess.Popen | None = None
+_llama_proc: subprocess.Popen | None = None
+
+# Fallback replies, used whenever no LLM is configured (or a request to it
+# fails) — keeps /api/reply always returning something instead of erroring.
+CANNED_REPLIES = [
+    "That's interesting — tell me more.",
+    "I hear you. What happened next?",
+    "Not sure I follow, but I'm listening.",
+    "Good point. What do you want to do about it?",
+    "Let's think about that for a second.",
+    "Sounds like a plan.",
+    "I don't have a real answer for that yet — I'm just a placeholder.",
+    "Can you say that again a different way?",
+    "Noted. Anything else?",
+    "That checks out.",
+]
+
+
+class ReplyRequest(BaseModel):
+    transcript: str
+    history: list[dict] | None = None
+
+
+class ReplyResponse(BaseModel):
+    reply: str
+
+
+class TranscribeResponse(BaseModel):
+    transcript: str
+
+
+def _wait_for_port(port: int, timeout: float = 30.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(0.5)
+    return False
+
+
+@app.on_event("startup")
+def start_whisper_server():
+    global _whisper_proc
+    logger.info("starting whisper-server: %s -m %s --port %s", WHISPER_SERVER_BIN, WHISPER_MODEL_PATH, WHISPER_PORT)
+    _whisper_proc = subprocess.Popen(
+        [
+            WHISPER_SERVER_BIN,
+            "-m", WHISPER_MODEL_PATH,
+            "--host", "127.0.0.1",
+            "--port", str(WHISPER_PORT),
+            "--convert",  # transcode incoming webm/opus via ffmpeg before inference
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
+    if _wait_for_port(WHISPER_PORT):
+        logger.info("whisper-server is up on port %s", WHISPER_PORT)
+    else:
+        logger.error("whisper-server did not come up within timeout")
+
+
+@app.on_event("startup")
+def start_llama_server():
+    global _llama_proc
+    if not Path(LLAMA_MODEL_PATH).exists():
+        logger.warning(
+            "no LLM model at %s — /api/reply will use canned stub replies until one is added",
+            LLAMA_MODEL_PATH,
+        )
+        return
+
+    logger.info("starting llama-server: %s -m %s --port %s", LLAMA_SERVER_BIN, LLAMA_MODEL_PATH, LLAMA_PORT)
+    try:
+        _llama_proc = subprocess.Popen(
+            [
+                LLAMA_SERVER_BIN,
+                "-m", LLAMA_MODEL_PATH,
+                "--host", "127.0.0.1",
+                "--port", str(LLAMA_PORT),
+                "-c", str(LLAMA_CTX_SIZE),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+    except FileNotFoundError:
+        logger.error("llama-server binary not found (LLAMA_SERVER_BIN=%s)", LLAMA_SERVER_BIN)
+        return
+
+    if _wait_for_port(LLAMA_PORT, timeout=120):
+        logger.info("llama-server is up on port %s", LLAMA_PORT)
+    else:
+        logger.error("llama-server did not come up within timeout")
+        _llama_proc = None
+
+
+@app.on_event("shutdown")
+def stop_background_servers():
+    if _whisper_proc:
+        _whisper_proc.terminate()
+    if _llama_proc:
+        _llama_proc.terminate()
+
+
+@app.get("/")
+def index():
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/api/transcribe", response_model=TranscribeResponse)
+async def transcribe(file: UploadFile = File(...)):
+    audio_bytes = await file.read()
+    if not audio_bytes:
+        return TranscribeResponse(transcript="")
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                WHISPER_INFERENCE_URL,
+                files={"file": (file.filename or "utterance.webm", audio_bytes, file.content_type or "application/octet-stream")},
+                data={"response_format": "json"},
+            )
+        resp.raise_for_status()
+    except httpx.HTTPError as err:
+        logger.error("whisper-server request failed: %s", err)
+        raise HTTPException(status_code=503, detail="transcription service unavailable") from err
+
+    text = resp.json().get("text", "").strip()
+    logger.info("transcript: %s", text)
+    return TranscribeResponse(transcript=text)
+
+
+@app.post("/api/reply", response_model=ReplyResponse)
+async def reply(req: ReplyRequest):
+    transcript = req.transcript.strip()
+    logger.info("reply for transcript: %s", transcript)
+    if not transcript:
+        return ReplyResponse(reply="I didn't catch that.")
+
+    if _llama_proc is not None:
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(
+                    LLAMA_CHAT_URL,
+                    json={
+                        "messages": [
+                            {"role": "system", "content": LLAMA_SYSTEM_PROMPT},
+                            {"role": "user", "content": transcript},
+                        ],
+                        "max_tokens": 200,
+                        "temperature": 0.7,
+                    },
+                )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip()
+            if content:
+                return ReplyResponse(reply=content)
+        except (httpx.HTTPError, KeyError, IndexError) as err:
+            logger.error("llama-server request failed, falling back to canned reply: %s", err)
+
+    return ReplyResponse(reply=random.choice(CANNED_REPLIES))
