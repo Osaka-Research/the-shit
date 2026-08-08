@@ -17,4 +17,4 @@ services:
     disk:
       name: voice-relay-data
       mountPath: /data
-      sizeGB: 4
+      sizeGB: 10
