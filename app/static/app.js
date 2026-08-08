@@ -15,6 +15,7 @@ const SILENCE_HOLD_MS = 900; // how long silence must persist to end an utteranc
 const NO_SPEECH_TIMEOUT_MS = 7000; // give up and re-arm if nothing was ever heard
 const MAX_UTTERANCE_MS = 20000; // hard cap so a stuck mic can't record forever
 const VOLUME_POLL_MS = 100;
+const CAPTURE_BUFFER_SIZE = 4096;
 
 // sessionActive: whether the user wants the hands-free loop running at all.
 // state: what the loop is doing right now, mirrored onto the button's
@@ -32,13 +33,19 @@ let audioCtx = null;
 let analyser = null;
 let volumeData = null;
 let volumeTimer = null;
-let mimeType = "";
 
-let currentRecorder = null;
-let currentChunks = [];
+// Raw PCM capture — sent to the server as WAV. Whisper's decoder reads WAV
+// natively, so this skips a per-request ffmpeg transcode that MediaRecorder's
+// webm/opus output would otherwise require server-side.
+let captureNode = null;
+let silentSink = null; // ScriptProcessorNode must connect to a destination
+// to reliably fire in all browsers — routed through zero gain so the mic
+// doesn't get echoed back out the speaker.
+let pcmChunks = [];
 let hasSpoken = false;
 let silenceStartedAt = null;
 let utteranceStartedAt = 0;
+let utteranceActive = false;
 
 function setOrbState(next) {
   state = next;
@@ -91,14 +98,52 @@ historyToggle.addEventListener("click", () => {
   }
 });
 
-function pickMimeType() {
-  const candidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
-  for (const candidate of candidates) {
-    if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(candidate)) {
-      return candidate;
-    }
+// ── WAV encoding ──
+
+function concatFloat32(chunks) {
+  let length = 0;
+  for (const c of chunks) length += c.length;
+  const result = new Float32Array(length);
+  let offset = 0;
+  for (const c of chunks) {
+    result.set(c, offset);
+    offset += c.length;
   }
-  return ""; // let the browser pick whatever it supports
+  return result;
+}
+
+function encodeWav(samples, sampleRate) {
+  const bytesPerSample = 2; // 16-bit PCM
+  const blockAlign = bytesPerSample; // mono
+  const dataSize = samples.length * bytesPerSample;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  const writeString = (offset, str) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+
+  writeString(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(8, "WAVE");
+  writeString(12, "fmt ");
+  view.setUint32(16, 16, true); // fmt chunk size
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * blockAlign, true); // byte rate
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, 16, true); // bits per sample
+  writeString(36, "data");
+  view.setUint32(40, dataSize, true);
+
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+
+  return new Blob([view], { type: "audio/wav" });
 }
 
 // ── conversation reply (text → server reply → optional speech) ──
@@ -169,13 +214,15 @@ function beginListeningAfterFlash(delay = STATUS_FLASH_MS) {
 }
 
 async function finalizeUtterance() {
-  const blob = new Blob(currentChunks, { type: mimeType || "audio/webm" });
-  currentChunks = [];
+  const samples = concatFloat32(pcmChunks);
+  pcmChunks = [];
   const spoke = hasSpoken;
 
   if (!sessionActive) return; // stopSession() already tore everything down
 
-  if (!spoke || blob.size < 800) {
+  // ~0.3s of audio at typical mic sample rates — anything shorter than that
+  // is noise, not speech.
+  if (!spoke || samples.length < audioCtx.sampleRate * 0.3) {
     // Nothing crossed the speech-volume threshold for the whole utterance
     // window — either genuine silence, or (if this keeps happening every
     // time) the mic/analyser isn't picking up audio at all. Flash a status
@@ -185,11 +232,13 @@ async function finalizeUtterance() {
     return;
   }
 
+  const blob = encodeWav(samples, audioCtx.sampleRate);
+
   setOrbState("thinking");
   setStatus("Transcribing...");
   try {
     const form = new FormData();
-    form.append("file", blob, "utterance.webm");
+    form.append("file", blob, "utterance.wav");
     const res = await fetch("/api/transcribe", { method: "POST", body: form });
     if (!res.ok) throw new Error("transcribe failed " + res.status);
     const data = await res.json();
@@ -208,23 +257,16 @@ async function finalizeUtterance() {
 }
 
 function stopUtteranceRecording() {
-  if (currentRecorder && currentRecorder.state !== "inactive") {
-    currentRecorder.stop();
-  }
+  utteranceActive = false;
+  finalizeUtterance();
 }
 
 function startUtteranceRecording() {
-  currentChunks = [];
+  pcmChunks = [];
   hasSpoken = false;
   silenceStartedAt = null;
   utteranceStartedAt = Date.now();
-
-  currentRecorder = new MediaRecorder(mediaStream, mimeType ? { mimeType } : undefined);
-  currentRecorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0) currentChunks.push(e.data);
-  };
-  currentRecorder.onstop = finalizeUtterance;
-  currentRecorder.start();
+  utteranceActive = true;
 }
 
 function volumeTick() {
@@ -281,7 +323,6 @@ async function startSession() {
     return;
   }
 
-  mimeType = pickMimeType();
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   if (audioCtx.state === "suspended") {
     // Some browsers create AudioContext in a suspended state even inside a
@@ -291,10 +332,26 @@ async function startSession() {
     await audioCtx.resume();
   }
   const source = audioCtx.createMediaStreamSource(mediaStream);
+
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = 1024;
   volumeData = new Uint8Array(analyser.fftSize);
   source.connect(analyser);
+
+  // Raw PCM capture for the WAV we send to the server. ScriptProcessorNode
+  // is deprecated in favor of AudioWorklet, but it's simpler (no separate
+  // module file to load) and still works everywhere — fine for this.
+  captureNode = audioCtx.createScriptProcessor(CAPTURE_BUFFER_SIZE, 1, 1);
+  captureNode.onaudioprocess = (e) => {
+    if (!utteranceActive) return;
+    pcmChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  };
+  silentSink = audioCtx.createGain();
+  silentSink.gain.value = 0;
+  source.connect(captureNode);
+  captureNode.connect(silentSink);
+  silentSink.connect(audioCtx.destination);
+
   volumeTimer = setInterval(volumeTick, VOLUME_POLL_MS);
 
   sessionActive = true;
@@ -304,6 +361,7 @@ async function startSession() {
 
 function stopSession() {
   sessionActive = false;
+  utteranceActive = false;
   setOrbState("idle");
   setLabel("Start Conversation");
   setStatus("Tap the orb to talk");
@@ -312,9 +370,14 @@ function stopSession() {
     clearInterval(volumeTimer);
     volumeTimer = null;
   }
-  if (currentRecorder && currentRecorder.state !== "inactive") {
-    currentRecorder.onstop = null; // don't finalize/send after an explicit stop
-    currentRecorder.stop();
+  if (captureNode) {
+    captureNode.onaudioprocess = null;
+    captureNode.disconnect();
+    captureNode = null;
+  }
+  if (silentSink) {
+    silentSink.disconnect();
+    silentSink = null;
   }
   if (mediaStream) {
     mediaStream.getTracks().forEach((track) => track.stop());
@@ -327,7 +390,7 @@ function stopSession() {
   speechSynthesis.cancel();
 }
 
-if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.MediaRecorder) {
+if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !(window.AudioContext || window.webkitAudioContext)) {
   setStatus("This browser doesn't support microphone recording.");
   talkBtn.disabled = true;
 } else {

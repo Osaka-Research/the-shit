@@ -105,7 +105,9 @@ def start_whisper_server():
             "-m", WHISPER_MODEL_PATH,
             "--host", "127.0.0.1",
             "--port", str(WHISPER_PORT),
-            "--convert",  # transcode incoming webm/opus via ffmpeg before inference
+            # No --convert: the frontend sends WAV directly (encoded from
+            # captured PCM), which whisper's decoder reads natively — skips
+            # an ffmpeg transcode subprocess on every single request.
         ],
     )
     if _wait_for_port(WHISPER_PORT, timeout=60):
