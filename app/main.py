@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import random
@@ -31,6 +32,12 @@ WHISPER_INFERENCE_URL = f"http://127.0.0.1:{WHISPER_PORT}/inference"
 # restart the app — no code changes needed to swap models.
 LLAMA_SERVER_BIN = os.environ.get("LLAMA_SERVER_BIN", "llama-server")
 LLAMA_MODEL_PATH = os.environ.get("LLAMA_MODEL_PATH", str(Path(__file__).parent.parent / "models" / "llm.gguf"))
+# If set (e.g. in the Render dashboard → Environment) and no file exists yet
+# at LLAMA_MODEL_PATH, it's downloaded from this URL on startup — a direct
+# link to a GGUF file (a Hugging Face .../resolve/main/....gguf URL works).
+# Render's disk is ephemeral, so this re-downloads on every fresh deploy;
+# for large models that costs real startup time.
+LLAMA_MODEL_URL = os.environ.get("LLAMA_MODEL_URL", "")
 LLAMA_PORT = int(os.environ.get("LLAMA_SERVER_PORT", "8091"))
 LLAMA_CTX_SIZE = os.environ.get("LLAMA_CTX_SIZE", "2048")
 LLAMA_CHAT_URL = f"http://127.0.0.1:{LLAMA_PORT}/v1/chat/completions"
@@ -106,15 +113,44 @@ def start_whisper_server():
         logger.error("whisper-server did not come up within timeout")
 
 
-@app.on_event("startup")
-def start_llama_server():
+async def _download_llama_model() -> bool:
+    dest = Path(LLAMA_MODEL_PATH)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    logger.info("downloading LLM model from %s", LLAMA_MODEL_URL)
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=None) as client:
+            async with client.stream("GET", LLAMA_MODEL_URL) as resp:
+                resp.raise_for_status()
+                with open(tmp, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=1024 * 1024):
+                        f.write(chunk)
+        tmp.rename(dest)
+        logger.info("LLM model download complete: %s", dest)
+        return True
+    except (httpx.HTTPError, OSError) as err:
+        logger.error("LLM model download failed: %s", err)
+        tmp.unlink(missing_ok=True)
+        return False
+
+
+async def _prepare_and_start_llama():
+    # Runs as a background task (not awaited by the startup event) so a
+    # multi-minute model download can't hold up /api/health or the rest of
+    # the app from becoming ready — Render's deploy health check would time
+    # out waiting on it otherwise.
     global _llama_proc
+
     if not Path(LLAMA_MODEL_PATH).exists():
-        logger.warning(
-            "no LLM model at %s — /api/reply will use canned stub replies until one is added",
-            LLAMA_MODEL_PATH,
-        )
-        return
+        if not LLAMA_MODEL_URL:
+            logger.warning(
+                "no LLM model at %s and no LLAMA_MODEL_URL set — /api/reply will use canned stub replies until one is added",
+                LLAMA_MODEL_PATH,
+            )
+            return
+        if not await _download_llama_model():
+            logger.warning("proceeding without an LLM — /api/reply will use canned stub replies")
+            return
 
     logger.info("starting llama-server: %s -m %s --port %s", LLAMA_SERVER_BIN, LLAMA_MODEL_PATH, LLAMA_PORT)
     try:
@@ -133,11 +169,16 @@ def start_llama_server():
         logger.error("llama-server binary not found (LLAMA_SERVER_BIN=%s)", LLAMA_SERVER_BIN)
         return
 
-    if _wait_for_port(LLAMA_PORT, timeout=120):
+    if await asyncio.to_thread(_wait_for_port, LLAMA_PORT, 120):
         logger.info("llama-server is up on port %s", LLAMA_PORT)
     else:
         logger.error("llama-server did not come up within timeout")
         _llama_proc = None
+
+
+@app.on_event("startup")
+async def start_llama_server():
+    asyncio.create_task(_prepare_and_start_llama())
 
 
 @app.on_event("shutdown")

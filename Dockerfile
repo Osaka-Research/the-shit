@@ -20,7 +20,23 @@ ARG WHISPER_MODEL=tiny.en
 RUN bash ./models/download-ggml-model.sh ${WHISPER_MODEL} \
     && mv models/ggml-${WHISPER_MODEL}.bin models/ggml-model.bin
 
-# --- stage 2: runtime ---
+# --- stage 2: build llama.cpp from source ---
+FROM python:3.12-slim AS llama-build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git cmake build-essential curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /llama.cpp
+WORKDIR /llama.cpp
+
+# Only the server target — no model baked in here. The model is downloaded
+# at container startup from LLAMA_MODEL_URL instead (see app/main.py), since
+# it needs to be swappable without rebuilding the image every time.
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build build -j --config Release --target llama-server
+
+# --- stage 3: runtime ---
 FROM python:3.12-slim
 
 # ffmpeg is what whisper-server's --convert flag shells out to, to turn the
@@ -44,10 +60,20 @@ COPY app ./app
 COPY --from=whisper-build /whisper.cpp/build/bin/ /opt/whisper/bin/
 COPY --from=whisper-build /whisper.cpp/models/ggml-model.bin /opt/whisper/models/ggml-model.bin
 
-ENV LD_LIBRARY_PATH=/opt/whisper/bin \
+# Same deal for llama-server's shared libs. No model copied here — see
+# LLAMA_MODEL_URL below, it's fetched at startup into /app/models instead
+# (the app's own writable dir, unlike /opt in this image).
+COPY --from=llama-build /llama.cpp/build/bin/ /opt/llama/bin/
+
+ENV LD_LIBRARY_PATH=/opt/whisper/bin:/opt/llama/bin \
     WHISPER_SERVER_BIN=/opt/whisper/bin/whisper-server \
     WHISPER_MODEL_PATH=/opt/whisper/models/ggml-model.bin \
-    WHISPER_SERVER_PORT=8090
+    WHISPER_SERVER_PORT=8090 \
+    LLAMA_SERVER_BIN=/opt/llama/bin/llama-server \
+    LLAMA_SERVER_PORT=8091
+# LLAMA_MODEL_URL is intentionally not set here — set it in the Render
+# dashboard (Settings → Environment) to a direct GGUF download URL. Without
+# it, /api/reply just keeps using the canned stub replies.
 
 # Match the port we actually bind to. EXPOSE is informational only.
 EXPOSE 10000
