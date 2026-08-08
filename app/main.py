@@ -283,7 +283,15 @@ async def reply(req: ReplyRequest):
 
     if _llama_proc is not None:
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
+            # On a 1 vCPU host, a 3B model generating 67 tokens took ~70s —
+            # 60s wasn't enough and just turned "slow" into "hard failure"
+            # (llama-server kept working after we'd already given up and
+            # fallen back). 120s matches the whisper proxy's timeout for the
+            # same reason. max_tokens capped lower too: this is a voice
+            # assistant, replies get read aloud — a shorter cap means both a
+            # snappier response and less time spent generating text nobody
+            # wants to hear in full anyway.
+            async with httpx.AsyncClient(timeout=120) as client:
                 resp = await client.post(
                     LLAMA_CHAT_URL,
                     json={
@@ -291,7 +299,7 @@ async def reply(req: ReplyRequest):
                             {"role": "system", "content": LLAMA_SYSTEM_PROMPT},
                             {"role": "user", "content": transcript},
                         ],
-                        "max_tokens": 200,
+                        "max_tokens": 80,
                         "temperature": 0.7,
                     },
                 )
