@@ -19,11 +19,11 @@ WORKDIR /whisper.cpp
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF \
     && cmake --build build -j 2 --config Release --target whisper-server
 
-# base.en — more accurate than tiny.en, needs the Standard plan's RAM
-# headroom (~150-250MB resident, too tight on Starter's 512MB alongside
-# everything else). Drop back to tiny.en if you ever move back to Starter —
-# override with: docker build --build-arg WHISPER_MODEL=tiny.en
-ARG WHISPER_MODEL=base.en
+# tiny.en — chosen for speed over base.en's accuracy. Fewer parameters
+# means real latency savings per request; noticeably worse on unclear audio,
+# accents, or background noise. Fine for clear speech in a quiet room —
+# override with: docker build --build-arg WHISPER_MODEL=base.en
+ARG WHISPER_MODEL=tiny.en
 RUN bash ./models/download-ggml-model.sh ${WHISPER_MODEL} \
     && mv models/ggml-${WHISPER_MODEL}.bin models/ggml-model.bin
 

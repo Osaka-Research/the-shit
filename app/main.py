@@ -106,6 +106,8 @@ def start_whisper_server():
             # No --convert: the frontend sends WAV directly (encoded from
             # captured PCM), which whisper's decoder reads natively — skips
             # an ffmpeg transcode subprocess on every single request.
+            "--best-of", "1",  # skip comparing multiple candidate decodes
+            "--no-fallback",   # skip re-decoding at higher temperature when unsure
         ],
     )
     if _wait_for_port(WHISPER_PORT, timeout=60):
