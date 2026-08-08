@@ -24,6 +24,12 @@ WHISPER_SERVER_BIN = os.environ.get("WHISPER_SERVER_BIN", "whisper-server")
 WHISPER_MODEL_PATH = os.environ.get("WHISPER_MODEL_PATH", "models/ggml-base.en.bin")
 WHISPER_PORT = int(os.environ.get("WHISPER_SERVER_PORT", "8090"))
 WHISPER_INFERENCE_URL = f"http://127.0.0.1:{WHISPER_PORT}/inference"
+# whisper-server defaults to 4 threads. On a fractional-vCPU host (Render
+# Starter = 0.5 vCPU) that's actively counterproductive — more threads than
+# actual CPU budget just adds context-switch overhead with no real
+# parallelism. 1 is the safe default; bump this if you're on a plan with
+# real dedicated cores (Standard = 1 vCPU, Pro = more).
+WHISPER_THREADS = os.environ.get("WHISPER_THREADS", "1")
 
 # llama-server is the swappable LLM backend for /api/reply. It only starts if
 # a model file actually exists at LLAMA_MODEL_PATH — until you drop one
@@ -105,6 +111,7 @@ def start_whisper_server():
             "-m", WHISPER_MODEL_PATH,
             "--host", "127.0.0.1",
             "--port", str(WHISPER_PORT),
+            "-t", WHISPER_THREADS,
             # No --convert: the frontend sends WAV directly (encoded from
             # captured PCM), which whisper's decoder reads natively — skips
             # an ffmpeg transcode subprocess on every single request.
@@ -216,7 +223,13 @@ async def transcribe(file: UploadFile = File(...)):
     if not audio_bytes:
         return TranscribeResponse(transcript="")
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        # Generous timeout — on a fractional-vCPU host, transcription can
+        # legitimately take longer than you'd expect for a few seconds of
+        # audio. A too-tight timeout here just turns "slow" into "broken":
+        # it kills the request mid-inference, whisper-server logs a wasted
+        # "client disconnected" instead of finishing, and the user gets a
+        # hard error instead of just waiting a bit longer.
+        async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 WHISPER_INFERENCE_URL,
                 files={"file": (file.filename or "utterance.webm", audio_bytes, file.content_type or "application/octet-stream")},

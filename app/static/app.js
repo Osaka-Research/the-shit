@@ -112,6 +112,27 @@ function concatFloat32(chunks) {
   return result;
 }
 
+const WHISPER_SAMPLE_RATE = 16000;
+
+// AudioContext usually runs at 48kHz — whisper only wants 16kHz, so sending
+// native-rate audio triples the upload size for no benefit. Simple linear
+// interpolation (no anti-aliasing filter) — good enough for speech, and
+// avoids pulling in a full resampling library for this.
+function downsampleTo16k(samples, inputRate) {
+  if (inputRate === WHISPER_SAMPLE_RATE) return samples;
+  const ratio = inputRate / WHISPER_SAMPLE_RATE;
+  const newLength = Math.floor(samples.length / ratio);
+  const result = new Float32Array(newLength);
+  for (let i = 0; i < newLength; i++) {
+    const srcIndex = i * ratio;
+    const srcFloor = Math.floor(srcIndex);
+    const srcCeil = Math.min(srcFloor + 1, samples.length - 1);
+    const frac = srcIndex - srcFloor;
+    result[i] = samples[srcFloor] * (1 - frac) + samples[srcCeil] * frac;
+  }
+  return result;
+}
+
 function encodeWav(samples, sampleRate) {
   const bytesPerSample = 2; // 16-bit PCM
   const blockAlign = bytesPerSample; // mono
@@ -232,7 +253,8 @@ async function finalizeUtterance() {
     return;
   }
 
-  const blob = encodeWav(samples, audioCtx.sampleRate);
+  const downsampled = downsampleTo16k(samples, audioCtx.sampleRate);
+  const blob = encodeWav(downsampled, WHISPER_SAMPLE_RATE);
 
   setOrbState("thinking");
   setStatus("Transcribing...");
